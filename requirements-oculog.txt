@@ -1,0 +1,9 @@
+# 메인 웹 서버(app.py) 환경 "oculog" — Python 3.11 권장
+#   conda create -n oculog python=3.11 -y && conda activate oculog
+#   pip install -r requirements-oculog.txt
+# GPU가 없어도 예측(추론)은 CPU로 동작한다.
+tensorflow>=2.15.0
+numpy>=1.24.0
+pandas>=2.0.0
+flask>=3.0.0
+requests>=2.31.0

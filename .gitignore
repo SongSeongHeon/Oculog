@@ -1,0 +1,18 @@
+# 데이터셋 (용량이 크고 이용약관상 재배포 금지: FaceForensics++, Celeb-DF, VCF 등)
+data/
+
+# 학습/평가 결과물 (재생성 가능)
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 주의: models/*.keras 는 데모 실행에 필요한 모델(각 약 1.8MB)이라 저장소에 포함한다.

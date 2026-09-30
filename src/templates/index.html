@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>오큘로그 — 시선 기반 딥페이크 탐지</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0b0d10; --surface:#12151a; --surface-2:#181c22;
+    --line:rgba(255,255,255,0.07); --line-strong:rgba(255,255,255,0.14);
+    --text:#f4f6f8; --text-dim:#d5dae0; --text-faint:#b8c0ca;
+    --scan:#22d3ee; --scan-dim:rgba(34,211,238,0.14); --scan-glow:rgba(34,211,238,0.35);
+    --alert:#fb7185; --alert-dim:rgba(251,113,133,0.14); --alert-glow:rgba(251,113,133,0.35);
+    --neutral:#94a3b8;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  html,body{height:100%;}
+  body{
+    background:var(--bg); color:var(--text); font-family:'Noto Sans KR', sans-serif;
+    min-height:100vh; display:flex; flex-direction:column;
+  }
+  .mono{font-family:'JetBrains Mono', monospace;}
+
+  /* ── 상단 바 (화상통화 앱의 타이틀바 느낌) ── */
+  .topbar{
+    height:52px; border-bottom:1px solid var(--line); display:flex; align-items:center;
+    justify-content:space-between; padding:0 20px; background:var(--surface);
+    flex-shrink:0;
+  }
+  .brand{display:flex; align-items:center; gap:10px;}
+  .brand-mark{width:22px; height:22px;}
+  .brand-name{font-family:'JetBrains Mono', monospace; font-size:13px; font-weight:700; letter-spacing:0.06em;}
+  .brand-sub{font-size:11.5px; color:var(--text-dim); margin-left:6px;}
+  .topbar-right{display:flex; align-items:center; gap:10px; font-family:'JetBrains Mono', monospace; font-size:11px; color:var(--text-dim);}
+  .live-pill{
+    display:flex; align-items:center; gap:6px; padding:4px 10px; border-radius:20px;
+    border:1px solid var(--line-strong); color:var(--text-dim);
+  }
+  .live-pill .dot{width:6px; height:6px; border-radius:50%; background:var(--text-faint);}
+  .live-pill.on{border-color:var(--scan); color:var(--scan);}
+  .live-pill.on .dot{background:var(--scan); box-shadow:0 0 8px var(--scan-glow); animation:blink 1.4s infinite;}
+  @keyframes blink{0%,100%{opacity:1;}50%{opacity:0.25;}}
+
+  /* ── 레이아웃: 좌측 비디오 영역 + 우측 사이드 패널 ── */
+  .stage{flex:1; display:grid; grid-template-columns:1fr 340px; min-height:0;}
+  @media (max-width:900px){.stage{grid-template-columns:1fr;}}
+
+  .video-area{position:relative; display:flex; flex-direction:column; padding:20px; min-width:0;}
+
+  /* 탭 (모드 전환) — 화상통화 앱의 상단 컨트롤처럼 */
+  .modes{display:flex; gap:4px; margin-bottom:14px; align-self:flex-start;}
+  .mode{
+    font-family:'JetBrains Mono', monospace; font-size:12px; padding:7px 14px; border-radius:6px;
+    border:1px solid var(--line-strong); background:transparent; color:var(--text-dim); cursor:pointer;
+    transition:all .15s;
+  }
+  .mode.active{background:var(--surface-2); color:var(--text); border-color:var(--scan);}
+  .mode:hover:not(.active){border-color:var(--text-dim);}
+
+  .pane{display:none; flex:1; flex-direction:column; min-height:0;}
+  .pane.active{display:flex;}
+
+  /* ── 비디오 타일 (핵심 시그니처) ── */
+  .tile{
+    position:relative; flex:1; min-height:360px; border-radius:10px; overflow:hidden;
+    background:#000; border:1px solid var(--line-strong);
+  }
+  .tile video{width:100%; height:100%; object-fit:cover; transform:scaleX(-1); display:block;}
+  .tile video.no-mirror{transform:none;}
+  .tile.idle video{opacity:0.15;}
+  .tile-placeholder{
+    position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:12px; color:var(--text-dim); font-family:'JetBrains Mono', monospace; font-size:12px;
+    pointer-events:none;
+  }
+  .tile-placeholder svg{width:44px; height:44px; opacity:0.5;}
+  .tile.idle .tile-placeholder{display:flex;}
+  .tile:not(.idle) .tile-placeholder{display:none;}
+
+  /* 코너 브래킷 (얼굴 추적 조준선) */
+  .brackets{position:absolute; inset:0; pointer-events:none; opacity:0; transition:opacity .3s;}
+  .tile.tracking .brackets{opacity:1;}
+  .brackets span{position:absolute; width:28px; height:28px; border:2px solid var(--scan); filter:drop-shadow(0 0 6px var(--scan-glow));}
+  .brackets .tl{top:18px; left:18px; border-right:none; border-bottom:none;}
+  .brackets .tr{top:18px; right:18px; border-left:none; border-bottom:none;}
+  .brackets .bl{bottom:18px; left:18px; border-right:none; border-top:none;}
+  .brackets .br{bottom:18px; right:18px; border-left:none; border-top:none;}
+  .tile.tracking.lost .brackets span{border-color:var(--alert); filter:drop-shadow(0 0 6px var(--alert-glow));}
+
+  /* HUD 오버레이 (상단/하단) */
+  .hud{position:absolute; left:14px; right:14px; display:flex; justify-content:space-between; align-items:center; pointer-events:none;}
+  .hud.top{top:14px;}
+  .hud.bottom{bottom:14px;}
+  .chip{
+    font-family:'JetBrains Mono', monospace; font-size:11px; padding:5px 10px; border-radius:4px;
+    background:rgba(11,13,16,0.78); backdrop-filter:blur(6px); color:var(--text-dim);
+    border:1px solid var(--line-strong); display:flex; align-items:center; gap:6px;
+  }
+  .chip.rec{color:var(--alert); border-color:rgba(251,113,133,0.4);}
+  .chip.rec::before{content:''; width:6px; height:6px; border-radius:50%; background:var(--alert); animation:blink 1.2s infinite;}
+  .chip.ok{color:var(--scan); border-color:rgba(34,211,238,0.4);}
+  .chip.warn{color:var(--alert); border-color:rgba(251,113,133,0.4);}
+  .chip.hidden{display:none;}
+
+  /* 진행 바 (타일 하단에 얇게) */
+  .progress{
+    position:absolute; left:0; right:0; bottom:0; height:3px; background:rgba(255,255,255,0.06);
+  }
+  .progress > i{display:block; height:100%; width:0%; background:var(--scan); box-shadow:0 0 8px var(--scan-glow); transition:width .3s linear;}
+
+  /* 큰 결과 오버레이 (판정 완료 시 타일 위에 뜸) */
+  .verdict{
+    position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center;
+    background:rgba(11,13,16,0.72); backdrop-filter:blur(8px); gap:10px;
+  }
+  .verdict.show{display:flex;}
+  .verdict .v-badge{
+    font-family:'JetBrains Mono', monospace; font-size:11px; letter-spacing:0.14em; padding:5px 12px;
+    border-radius:4px; border:1px solid;
+  }
+  .verdict .v-label{font-size:34px; font-weight:700; letter-spacing:-0.01em;}
+  .verdict .v-conf{font-family:'JetBrains Mono', monospace; font-size:42px; font-weight:700;}
+  .verdict .v-sub{font-size:13px; color:var(--text-dim);}
+  .verdict.genuine .v-badge{color:var(--scan); border-color:var(--scan); background:var(--scan-dim);}
+  .verdict.genuine .v-label, .verdict.genuine .v-conf{color:var(--scan);}
+  .verdict.fake .v-badge{color:var(--alert); border-color:var(--alert); background:var(--alert-dim);}
+  .verdict.fake .v-label, .verdict.fake .v-conf{color:var(--alert);}
+
+  /* 업로드 모드 드롭존 (타일과 동일한 비율로) */
+  .dropzone{
+    flex:1; min-height:360px; border-radius:10px; border:1.5px dashed var(--line-strong);
+    background:var(--surface); display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:12px; cursor:pointer; transition:border-color .2s, background .2s; text-align:center; padding:24px;
+  }
+  .dropzone.dragover{border-color:var(--scan); background:var(--scan-dim);}
+  .dropzone svg{width:40px; height:40px; color:var(--text-dim);}
+  .dropzone p{font-size:14px; color:var(--text);}
+  .dropzone .hint{font-family:'JetBrains Mono', monospace; font-size:11.5px; color:var(--text-dim);}
+  .dropzone .filename{font-family:'JetBrains Mono', monospace; font-size:12.5px; color:var(--scan); word-break:break-all; margin-top:6px;}
+  input[type=file]{display:none;}
+
+  /* 업로드 진행 상태 (진행률을 정확히 모르니 무한 반복 바 + 경과 시간으로 체감) */
+  .upload-progress{margin-top:16px;}
+  .upload-progress.hidden{display:none;}
+  .upload-progress-bar{
+    height:6px; border-radius:3px; background:rgba(255,255,255,0.06); overflow:hidden; position:relative;
+  }
+  .upload-progress-bar > i{
+    position:absolute; top:0; bottom:0; width:35%; border-radius:3px;
+    background:linear-gradient(90deg, transparent, var(--scan), transparent);
+    box-shadow:0 0 10px var(--scan-glow);
+    animation:upload-sweep 1.3s ease-in-out infinite;
+  }
+  @keyframes upload-sweep{
+    0%{ left:-35%; }
+    100%{ left:100%; }
+  }
+  .upload-progress-row{
+    display:flex; justify-content:space-between; margin-top:8px;
+    font-size:12.5px; color:var(--text-dim);
+  }
+
+  /* 실제 진행률을 받을 때는 반복 바 대신 채워지는 바로 바꾼다 */
+  .upload-progress-bar > i.determinate{
+    animation:none; left:0; width:0%; border-radius:3px; background:var(--scan);
+    transition:width .3s linear;
+  }
+  /* 업로드 미리보기 타일 */
+  .tile.hidden, .dropzone.hidden{ display:none; }
+  #uploadPreview{ object-fit:contain; background:#000; }
+
+  /* 하단 컨트롤 바 (화상통화 앱의 통화 버튼 느낌) */
+  .controls{display:flex; justify-content:center; gap:12px; margin-top:16px;}
+  .btn{
+    font-family:'Noto Sans KR', sans-serif; font-size:14px; font-weight:700; padding:13px 28px;
+    border-radius:999px; border:none; cursor:pointer; transition:all .15s; display:flex; align-items:center; gap:8px;
+  }
+  .btn svg{width:16px; height:16px;}
+  .btn.primary{background:var(--scan); color:#04191d;}
+  .btn.primary:hover:not(:disabled){filter:brightness(1.1);}
+  .btn.danger{background:var(--alert); color:#2a0810;}
+  .btn:disabled{opacity:0.45; cursor:not-allowed;}
+  .btn.secondary{background:transparent; color:var(--text); border:1px solid var(--line-strong);}
+  .btn.secondary:hover:not(:disabled){border-color:var(--scan); color:var(--scan);}
+  .btn.hidden{display:none;}
+  .btn:active:not(:disabled){transform:scale(0.97);}
+
+  /* 화면 공유 crop 선택용 캔버스 오버레이 */
+  #cropCanvas{
+    position:absolute; inset:0; width:100%; height:100%; cursor:crosshair;
+    display:none; z-index:5;
+  }
+  #cropCanvas.active{display:block;}
+  .crop-hint{
+    position:absolute; top:14px; left:50%; transform:translateX(-50%); z-index:6;
+    font-family:'JetBrains Mono', monospace; font-size:12px; color:var(--text);
+    background:rgba(11,13,16,0.85); backdrop-filter:blur(6px); padding:7px 16px;
+    border-radius:20px; border:1px solid var(--scan); pointer-events:none;
+  }
+  .crop-hint.hidden{display:none;}
+
+  /* ── 우측 사이드 패널 (분석 로그/지표) ── */
+  .side{
+    border-left:1px solid var(--line); background:var(--surface); display:flex; flex-direction:column;
+    padding:20px; gap:18px; overflow-y:auto;
+  }
+  @media (max-width:900px){.side{border-left:none; border-top:1px solid var(--line);}}
+  .side h3{font-family:'JetBrains Mono', monospace; font-size:11px; letter-spacing:0.1em; color:var(--scan); font-weight:600;}
+
+  .metrics{display:grid; grid-template-columns:1fr 1fr; gap:10px;}
+  .metric{background:var(--surface-2); border:1px solid var(--line); border-radius:8px; padding:12px;}
+  .metric .k{font-family:'JetBrains Mono', monospace; font-size:10px; color:var(--text-dim); letter-spacing:0.06em;}
+  .metric .v{font-family:'JetBrains Mono', monospace; font-size:20px; font-weight:700; margin-top:4px; color:var(--text);}
+  .metric .v.dim{color:var(--text-faint);}
+
+  /* 시선/깜빡임 개별 점수 게이지 */
+  .gauge{margin-top:4px;}
+  .gauge-row{display:flex; justify-content:space-between; font-family:'JetBrains Mono', monospace; font-size:11px; color:var(--text-dim); margin-bottom:5px;}
+  .gauge-row b{color:var(--text); font-weight:500;}
+  .gauge-bar{height:5px; border-radius:3px; background:rgba(255,255,255,0.06); overflow:hidden;}
+  .gauge-bar > i{display:block; height:100%; width:0%; transition:width .8s cubic-bezier(.16,1,.3,1);}
+  .gauge-bar > i.g{background:var(--scan);}
+  .gauge-bar > i.f{background:var(--alert);}
+
+  .log{
+    flex:1; min-height:120px; background:#0a0c0f; border:1px solid var(--line); border-radius:8px;
+    padding:12px; font-family:'JetBrains Mono', monospace; font-size:11px; line-height:1.75;
+    color:var(--text-dim); overflow-y:auto;
+  }
+  .log .t{color:var(--text-dim); margin-right:8px;}
+  .log .ok{color:var(--scan);}
+  .log .err{color:var(--alert);}
+  .log .em{color:var(--text);}
+
+  .side-note{font-size:11.5px; color:var(--text-dim); line-height:1.6;}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <ellipse cx="12" cy="12" rx="10" ry="6" stroke="var(--scan)" stroke-width="1.6"/>
+      <circle id="brandPupil" cx="12" cy="12" r="3" fill="var(--scan)"/>
+    </svg>
+    <span class="brand-name">OCULOG</span>
+    <span class="brand-sub">시선 기반 딥페이크 탐지</span>
+  </div>
+  <div class="topbar-right">
+    <div class="live-pill" id="livePill"><span class="dot"></span><span id="livePillText">대기</span></div>
+  </div>
+</div>
+
+<div class="stage">
+  <div class="video-area">
+    <div class="modes">
+      <button class="mode active" data-mode="stream">실시간 통화</button>
+      <button class="mode" data-mode="screen">화면 공유</button>
+      <button class="mode" data-mode="upload">영상 업로드</button>
+    </div>
+
+    <!-- 실시간 모드 -->
+    <div class="pane active" id="pane-stream">
+      <div class="tile idle" id="tile">
+        <video id="webcam" autoplay playsinline muted></video>
+        <div class="tile-placeholder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+            <rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/>
+          </svg>
+          <span>카메라 대기 중</span>
+        </div>
+        <div class="brackets"><span class="tl"></span><span class="tr"></span><span class="bl"></span><span class="br"></span></div>
+        <div class="hud top">
+          <div class="chip rec hidden" id="chipRec">REC</div>
+          <div class="chip hidden" id="chipCount">0 / 300</div>
+        </div>
+        <div class="hud bottom">
+          <div class="chip hidden" id="chipFace">얼굴 탐색 중</div>
+          <div class="chip hidden" id="chipElapsed">00:00</div>
+        </div>
+        <div class="progress"><i id="progressFill"></i></div>
+        <div class="verdict" id="verdict">
+          <span class="v-badge" id="vBadge"></span>
+          <span class="v-label" id="vLabel"></span>
+          <span class="v-conf" id="vConf"></span>
+          <span class="v-sub" id="vSub"></span>
+        </div>
+      </div>
+      <div class="controls">
+        <button class="btn primary" id="streamBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/></svg>
+          <span id="streamBtnText">분석 시작</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- 화면 공유 모드 (상대방 Zoom/Teams 화면을 캡처해서 얼굴 영역만 선택 분석) -->
+    <div class="pane" id="pane-screen">
+      <div class="tile idle" id="screenTile">
+        <video id="screenVideo" class="no-mirror" autoplay playsinline muted></video>
+        <canvas id="cropCanvas"></canvas>
+        <div class="tile-placeholder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" aria-hidden="true">
+            <rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>
+          </svg>
+          <span>공유할 화면(Zoom/Teams 등)을 선택하세요</span>
+        </div>
+        <div class="crop-hint hidden" id="cropHint">상대방 얼굴 영역을 드래그로 선택하세요</div>
+        <div class="brackets"><span class="tl"></span><span class="tr"></span><span class="bl"></span><span class="br"></span></div>
+        <div class="hud top">
+          <div class="chip rec hidden" id="screenChipRec">REC</div>
+          <div class="chip hidden" id="screenChipCount">0 / 300</div>
+        </div>
+        <div class="hud bottom">
+          <div class="chip hidden" id="screenChipFace">얼굴 탐색 중</div>
+          <div class="chip hidden" id="screenChipElapsed">00:00</div>
+        </div>
+        <div class="progress"><i id="screenProgressFill"></i></div>
+        <div class="verdict" id="screenVerdict">
+          <span class="v-badge" id="screenVBadge"></span>
+          <span class="v-label" id="screenVLabel"></span>
+          <span class="v-conf" id="screenVConf"></span>
+          <span class="v-sub" id="screenVSub"></span>
+        </div>
+      </div>
+      <div class="controls">
+        <button class="btn primary" id="screenShareBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+          <span id="screenShareBtnText">화면 공유 시작</span>
+        </button>
+        <button class="btn secondary hidden" id="recropBtn">영역 다시 선택</button>
+        <button class="btn primary hidden" id="screenStreamBtn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/></svg>
+          <span id="screenStreamBtnText">분석 시작</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- 업로드 모드 -->
+    <div class="pane" id="pane-upload">
+      <div class="dropzone" id="dropzone">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
+          <path d="M12 16V4M12 4L7 9M12 4l5 5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M4 16v3a2 2 0 002 2h12a2 2 0 002-2v-3" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <p>영상 파일을 끌어놓거나 클릭해서 선택</p>
+        <span class="hint">mp4 · avi · mov · mkv (최대 200MB)</span>
+        <div class="filename" id="filename"></div>
+      </div>
+      <div class="tile hidden" id="uploadTile">
+        <video id="uploadPreview" class="no-mirror" muted playsinline preload="metadata"></video>
+        <div class="hud top">
+          <div class="chip" id="uploadChipName"></div>
+          <div class="chip hidden" id="uploadChipPos">00:00 / 00:00</div>
+        </div>
+      </div>
+      <input type="file" id="fileInput" accept="video/mp4,video/avi,video/quicktime,video/x-matroska">
+      <div class="upload-progress hidden" id="uploadProgress">
+        <div class="upload-progress-bar"><i id="uploadProgressFill"></i></div>
+        <div class="upload-progress-row">
+          <span id="uploadProgressStage">영상 업로드 중…</span>
+          <span class="mono" id="uploadProgressTime">00:00</span>
+        </div>
+      </div>
+      <div class="controls">
+        <button class="btn secondary hidden" id="changeFileBtn">파일 변경</button>
+        <button class="btn primary" id="analyzeBtn" disabled>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+          <span>영상 분석</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <aside class="side">
+    <h3>분석 지표</h3>
+    <div class="metrics">
+      <div class="metric"><div class="k">최종 판정</div><div class="v dim" id="mVerdict">—</div></div>
+      <div class="metric"><div class="k">신뢰도</div><div class="v dim" id="mConf">—</div></div>
+      <div class="metric"><div class="k">분석 프레임</div><div class="v dim" id="mFrames">—</div></div>
+      <div class="metric"><div class="k">얼굴 검출률</div><div class="v dim" id="mDet">—</div></div>
+    </div>
+
+    <h3>신호별 점수</h3>
+    <div class="gauge">
+      <div class="gauge-row"><span>시선 패턴 <b>(가중 0.9)</b></span><span id="gGazeVal">—</span></div>
+      <div class="gauge-bar"><i id="gGaze"></i></div>
+    </div>
+    <div class="gauge">
+      <div class="gauge-row"><span>눈 깜빡임 <b>(가중 0.1)</b></span><span id="gBlinkVal">—</span></div>
+      <div class="gauge-bar"><i id="gBlink"></i></div>
+    </div>
+    <p class="side-note">점수는 0(실제)~1(딥페이크). 시선 신호를 주 근거로, 깜빡임 신호를 보조로 결합해 최종 판정합니다.</p>
+
+    <h3>로그</h3>
+    <div class="log" id="log"><span class="t">--:--</span>시스템 준비됨. 모드를 선택하세요.</div>
+  </aside>
+</div>
+
+<script>
+  // ── 공통 유틸 ──
+  const $ = (id) => document.getElementById(id);
+  const logEl = $('log');
+  function log(msg, cls=''){
+    const now = new Date();
+    const t = now.toTimeString().slice(0,8);
+    const line = document.createElement('div');
+    line.innerHTML = `<span class="t">${t}</span><span class="${cls}">${msg}</span>`;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function pct(x){ return Math.round(x*100); }
+
+  // ── 모드 전환 ──
+  document.querySelectorAll('.mode').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.mode').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.pane').forEach(p => p.classList.remove('active'));
+      btn.classList.add('active');
+      $('pane-' + btn.dataset.mode).classList.add('active');
+      if (btn.dataset.mode !== 'stream') stopStreaming();
+      if (btn.dataset.mode !== 'screen') stopScreenShare();
+      resetSidePanel();
+    });
+  });
+
+  // ── 사이드 패널 갱신 ──
+  function resetSidePanel(){
+    ['mVerdict','mConf','mFrames','mDet'].forEach(id => { $(id).textContent='—'; $(id).classList.add('dim'); $(id).style.color=''; });
+    $('gGaze').style.width='0%'; $('gBlink').style.width='0%';
+    $('gGazeVal').textContent='—'; $('gBlinkVal').textContent='—';
+  }
+  function fillSidePanel(data){
+    const isFake = data.is_fake;
+    const color = isFake ? 'var(--alert)' : 'var(--scan)';
+    $('mVerdict').textContent = isFake ? 'FAKE' : 'REAL';
+    $('mVerdict').classList.remove('dim'); $('mVerdict').style.color = color;
+    $('mConf').textContent = data.confidence + '%'; $('mConf').classList.remove('dim');
+    $('mFrames').textContent = data.frames_used; $('mFrames').classList.remove('dim');
+    $('mDet').textContent = data.detection_rate + '%'; $('mDet').classList.remove('dim');
+
+    const g = data.gaze_score ?? null;
+    const b = data.blink_score ?? null;
+    if (g !== null){
+      $('gGazeVal').textContent = g.toFixed(3);
+      const bar = $('gGaze'); bar.className = (g>=0.5?'f':'g');
+      requestAnimationFrame(()=> bar.style.width = pct(g)+'%');
+    }
+    if (b !== null){
+      $('gBlinkVal').textContent = b.toFixed(3);
+      const bar = $('gBlink'); bar.className = (b>=0.5?'f':'g');
+      requestAnimationFrame(()=> bar.style.width = pct(b)+'%');
+    } else {
+      $('gBlinkVal').textContent = '미사용';
+    }
+  }
+
+  // ── 실시간 모드 ──
+  const tile = $('tile');
+  const webcam = $('webcam');
+  const streamBtn = $('streamBtn');
+  const streamBtnText = $('streamBtnText');
+  const chipRec = $('chipRec'), chipCount = $('chipCount'), chipFace = $('chipFace'), chipElapsed = $('chipElapsed');
+  const progressFill = $('progressFill');
+  const verdict = $('verdict');
+  const livePill = $('livePill'), livePillText = $('livePillText');
+
+  const TARGET_SAMPLES = 300;
+  const CAPTURE_INTERVAL_MS = 200;
+
+  let mediaStream = null, ptgazeServerUrl = null, sessionId = null;
+  let captureTimer = null, elapsedTimer = null, streaming = false, startedAt = 0;
+  const canvas = document.createElement('canvas');
+
+  async function getServerUrl(){
+    if (ptgazeServerUrl) return ptgazeServerUrl;
+    const r = await fetch('/config/ptgaze-server'); const d = await r.json();
+    ptgazeServerUrl = d.url; return ptgazeServerUrl;
+  }
+
+  streamBtn.addEventListener('click', () => streaming ? stopStreaming() : startStreaming());
+
+  function setLive(on, text){
+    livePill.classList.toggle('on', on); livePillText.textContent = text;
+  }
+
+  async function startStreaming(){
+    verdict.classList.remove('show'); verdict.className='verdict';
+    resetSidePanel();
+    try{
+      mediaStream = await navigator.mediaDevices.getUserMedia({ video:{ width:640, height:480 } });
+      webcam.srcObject = mediaStream;
+      const url = await getServerUrl();
+      const r = await fetch(url + '/stream/start', { method:'POST' }); const d = await r.json();
+      sessionId = d.session_id;
+
+      streaming = true; startedAt = Date.now();
+      tile.classList.remove('idle'); tile.classList.add('tracking');
+      streamBtn.classList.replace('primary','danger'); streamBtnText.textContent = '분석 중지';
+      chipRec.classList.remove('hidden'); chipCount.classList.remove('hidden');
+      chipFace.classList.remove('hidden'); chipElapsed.classList.remove('hidden');
+      setLive(true, 'LIVE');
+      log('세션 시작. 10초 분량의 시선 데이터를 수집합니다.', 'em');
+
+      captureTimer = setInterval(captureAndSend, CAPTURE_INTERVAL_MS);
+      elapsedTimer = setInterval(()=>{
+        const s = Math.floor((Date.now()-startedAt)/1000);
+        chipElapsed.textContent = String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+      }, 500);
+    }catch(err){
+      log('카메라 접근 실패: ' + err.message, 'err');
+      stopStreaming();
+    }
+  }
+
+  async function captureAndSend(){
+    if (!streaming || !webcam.videoWidth) return;
+    canvas.width = webcam.videoWidth; canvas.height = webcam.videoHeight;
+    canvas.getContext('2d').drawImage(webcam, 0, 0);
+    canvas.toBlob(async (blob) => {
+      if (!blob || !streaming) return;
+      const fd = new FormData(); fd.append('session_id', sessionId); fd.append('frame', blob, 'frame.jpg');
+      try{
+        const r = await fetch(ptgazeServerUrl + '/stream/frame', { method:'POST', body:fd });
+        const d = await r.json();
+        const found = d.face_detected;
+        chipFace.textContent = found ? '얼굴 추적 중' : '얼굴을 화면 중앙에';
+        chipFace.className = 'chip ' + (found ? 'ok' : 'warn');
+        tile.classList.toggle('lost', !found);
+        const p = Math.min(100, Math.round(d.samples_collected / TARGET_SAMPLES * 100));
+        chipCount.textContent = `${d.samples_collected} / ${TARGET_SAMPLES}`;
+        progressFill.style.width = p + '%';
+        if (d.samples_collected >= TARGET_SAMPLES) await runPrediction();
+      }catch(e){ console.warn('프레임 전송 실패', e); }
+    }, 'image/jpeg', 0.8);
+  }
+
+  async function runPrediction(){
+    // 한 시퀀스가 완성되면 캡처를 멈추고 판정한다. 판정 후 자동으로 다음
+    // 시퀀스로 넘어가지 않고 세션을 종료한다 (카메라 OFF). 다시 분석하려면
+    // "분석 시작"을 다시 누른다.
+    clearInterval(captureTimer); captureTimer = null;
+    chipRec.classList.add('hidden');
+    setLive(true, '판정 중');
+    log('수집 완료. 시선+깜빡임 앙상블로 판정합니다…');
+
+    try{
+      const r = await fetch('/analyze/stream/predict', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ session_id: sessionId }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.error) throw new Error(d.error || '분석에 실패했습니다.');
+      showVerdict(d);
+      fillSidePanel(d);
+      log(`판정: ${d.is_fake ? 'FAKE' : 'REAL'} (신뢰도 ${d.confidence}%)`, d.is_fake ? 'err' : 'ok');
+      if (d.used_blink_ensemble === false) log('깜빡임 데이터 부족 → 시선 단독으로 판정됨', 'em');
+    }catch(err){
+      log('판정 오류: ' + err.message, 'err');
+    }finally{
+      // 세션 종료 & 카메라 OFF (다음 시퀀스로 자동 진행하지 않음)
+      stopStreaming(/*keepVerdict*/true);
+    }
+  }
+
+  function showVerdict(d){
+    const isFake = d.is_fake;
+    verdict.className = 'verdict show ' + (isFake ? 'fake' : 'genuine');
+    $('vBadge').textContent = isFake ? 'DEEPFAKE DETECTED' : 'AUTHENTIC';
+    $('vLabel').textContent = isFake ? '딥페이크로 추정' : '실제 영상으로 추정';
+    $('vConf').textContent = d.confidence + '%';
+    $('vSub').textContent = isFake
+      ? '시선 움직임이 인위적으로 매끈합니다'
+      : '시선에 자연스러운 미세 떨림이 관측됩니다';
+  }
+
+  function stopStreaming(keepVerdict=false){
+    streaming = false;
+    if (captureTimer){ clearInterval(captureTimer); captureTimer=null; }
+    if (elapsedTimer){ clearInterval(elapsedTimer); elapsedTimer=null; }
+    if (mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); mediaStream=null; }
+    if (sessionId && ptgazeServerUrl){
+      fetch(ptgazeServerUrl + '/stream/end', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ session_id: sessionId }) }).catch(()=>{});
+      sessionId = null;
+    }
+    tile.classList.add('idle'); tile.classList.remove('tracking','lost');
+    streamBtn.classList.replace('danger','primary'); streamBtnText.textContent = '분석 시작';
+    [chipRec, chipCount, chipFace, chipElapsed].forEach(c => c.classList.add('hidden'));
+    progressFill.style.width = '0%';
+    if (!keepVerdict){ verdict.classList.remove('show'); }
+    setLive(false, keepVerdict ? '판정 완료' : '대기');
+    if (keepVerdict) log('세션 종료. 카메라를 껐습니다. 다시 분석하려면 "분석 시작"을 누르세요.');
+  }
+  window.addEventListener('beforeunload', () => stopStreaming());
+
+  // ── 업로드 모드 ──
+  // 서버가 처리한 프레임 위치(실제 진행률)를 받아 진행 바와 미리보기 위치에 반영한다.
+  // 서버에 진행률 기능(/analyze/upload/start)이 없으면 예전 방식(/analyze/upload)으로 동작한다.
+  const dropzone = $('dropzone'), fileInput = $('fileInput'), filenameEl = $('filename'), analyzeBtn = $('analyzeBtn');
+  const uploadProgress = $('uploadProgress'), uploadProgressStage = $('uploadProgressStage'), uploadProgressTime = $('uploadProgressTime');
+  const uploadProgressFill = $('uploadProgressFill');
+  const uploadTile = $('uploadTile'), uploadPreview = $('uploadPreview');
+  const uploadChipName = $('uploadChipName'), uploadChipPos = $('uploadChipPos');
+  const changeFileBtn = $('changeFileBtn');
+  let selectedFile = null, previewUrl = null;
+  let uploadTimer = null, uploadStartedAt = 0, uploadRun = 0;
+
+  dropzone.addEventListener('click', () => fileInput.click());
+  dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+  dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+  dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('dragover'); if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]); });
+  fileInput.addEventListener('change', () => { if (fileInput.files.length) setFile(fileInput.files[0]); });
+  changeFileBtn.addEventListener('click', () => fileInput.click());
+
+  function fmtTime(sec){
+    if (!isFinite(sec)) return '--:--';
+    const s = Math.max(0, Math.round(sec));
+    return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+  }
+
+  function setFile(f){
+    selectedFile=f; filenameEl.textContent=f.name; analyzeBtn.disabled=false; resetSidePanel(); log(`파일 선택: ${f.name}`);
+    stopUploadProgress();
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = URL.createObjectURL(f);
+    uploadPreview.src = previewUrl;
+    uploadChipName.textContent = f.name;
+    uploadTile.classList.remove('hidden'); dropzone.classList.add('hidden'); changeFileBtn.classList.remove('hidden');
+  }
+  // 브라우저가 못 여는 형식(avi/mkv 등)이면 미리보기 없이 기존 화면(드롭존)을 그대로 쓴다
+  uploadPreview.addEventListener('error', () => {
+    if (!uploadPreview.getAttribute('src')) return;
+    uploadTile.classList.add('hidden'); dropzone.classList.remove('hidden');
+  });
+
+  function showUploadProgress(stage){
+    uploadProgress.classList.remove('hidden');
+    uploadProgressStage.textContent = stage;
+  }
+  function setUploadBar(p){ // p: 0~1, null이면 진행률을 모르는 상태(반복 바)
+    if (p === null || p === undefined){
+      uploadProgressFill.classList.remove('determinate'); uploadProgressFill.style.width = '';
+    } else {
+      uploadProgressFill.classList.add('determinate'); uploadProgressFill.style.width = Math.round(p*100)+'%';
+    }
+  }
+  function startUploadClock(){
+    if (uploadTimer) clearInterval(uploadTimer);
+    uploadStartedAt = Date.now();
+    uploadProgressTime.textContent = '00:00';
+    uploadTimer = setInterval(() => { uploadProgressTime.textContent = fmtTime((Date.now() - uploadStartedAt) / 1000); }, 500);
+  }
+  function stopUploadProgress(){
+    if (uploadTimer){ clearInterval(uploadTimer); uploadTimer = null; }
+    uploadProgress.classList.add('hidden');
+    setUploadBar(null);
+    uploadChipPos.classList.add('hidden');
+  }
+
+  async function pollUploadJob(jobId, myRun){
+    while (true){
+      if (myRun !== uploadRun) return null;
+      const r = await fetch('/analyze/upload/progress?job_id=' + encodeURIComponent(jobId));
+      const d = await r.json();
+      if (!r.ok || d.error) throw new Error(d.error || '분석에 실패했습니다.');
+      if (d.state === 'done'){
+        setUploadBar(1); uploadProgressStage.textContent = '판정 완료';
+        return d.result;
+      }
+      if (d.state === 'queued'){
+        setUploadBar(0); uploadProgressStage.textContent = '다른 분석이 끝나기를 기다리는 중…';
+      } else if (d.progress === null || d.progress === undefined){
+        setUploadBar(null); uploadProgressStage.textContent = '시선·깜빡임 패턴 분석 중…';
+      } else {
+        setUploadBar(d.progress);
+        const dur = uploadPreview.duration;
+        if (isFinite(dur) && dur > 0){
+          // 서버가 처리한 위치로 미리보기를 옮긴다 (재생이 아니라 위치 이동)
+          uploadPreview.currentTime = Math.min(dur, d.progress * dur);
+          uploadChipPos.textContent = `${fmtTime(d.progress * dur)} / ${fmtTime(dur)}`;
+          uploadChipPos.classList.remove('hidden');
+        }
+        uploadProgressStage.textContent = `시선·깜빡임 패턴 분석 중 ${pct(d.progress)}%`;
+      }
+      await new Promise(res => setTimeout(res, 500));
+    }
+  }
+
+  async function analyzeUploadLegacy(){
+    setUploadBar(null);
+    uploadProgressStage.textContent = '시선·깜빡임 패턴 추출 및 판정 중…';
+    const fd = new FormData(); fd.append('video', selectedFile);
+    const r = await fetch('/analyze/upload', { method:'POST', body:fd });
+    const d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || '분석에 실패했습니다.');
+    return d;
+  }
+
+  analyzeBtn.addEventListener('click', async () => {
+    if (!selectedFile) return;
+    const myRun = ++uploadRun;
+    analyzeBtn.disabled = true; changeFileBtn.disabled = true; setLive(true, '분석 중'); resetSidePanel();
+    showUploadProgress('영상 업로드 중…'); setUploadBar(0); startUploadClock();
+    log('영상 업로드 및 시선 추출 중…', 'em');
+    try{
+      const fd = new FormData(); fd.append('video', selectedFile);
+      const startResp = await fetch('/analyze/upload/start', { method:'POST', body:fd });
+      let d;
+      if (startResp.status === 404){
+        d = await analyzeUploadLegacy();   // 서버에 진행률 기능이 없으면 예전 방식으로
+      } else {
+        const start = await startResp.json();
+        if (!startResp.ok || start.error) throw new Error(start.error || '분석을 시작하지 못했습니다.');
+        d = await pollUploadJob(start.job_id, myRun);
+        if (d === null) return;            // 새 분석이 시작되어 이 실행은 버린다
+      }
+      fillSidePanel(d);
+      log(`판정: ${d.is_fake ? 'FAKE' : 'REAL'} (신뢰도 ${d.confidence}%, ${d.frames_used} 프레임)`, d.is_fake ? 'err' : 'ok');
+      if (d.used_blink_ensemble === false) log('깜빡임 데이터 부족 → 시선 단독으로 판정됨', 'em');
+    }catch(err){
+      log('분석 오류: ' + err.message, 'err');
+    }finally{
+      if (myRun === uploadRun){
+        stopUploadProgress();
+        analyzeBtn.disabled = false; changeFileBtn.disabled = false; setLive(false, '판정 완료');
+      }
+    }
+  });
+
+  // ── 브랜드 마크 눈동자 애니메이션 ──
+  const pupil = $('brandPupil'); let t = 0;
+  (function anim(){ t += 0.02; pupil.setAttribute('cx', (12 + Math.sin(t)*3 + Math.sin(t*3.1)*0.8).toFixed(2)); pupil.setAttribute('cy', (12 + Math.cos(t*0.7)*1.2).toFixed(2)); requestAnimationFrame(anim); })();
+
+  // ══════════════════════════════════════════════════════════
+  // 화면 공유 모드 — 상대방 Zoom/Teams 화면을 캡처해 얼굴 영역만
+  // crop해서 기존 시선 추출 파이프라인(ptgaze_server)에 그대로 전송한다.
+  // 사용자가 마우스 드래그로 crop 영역(사각형)을 직접 지정한다.
+  // ══════════════════════════════════════════════════════════
+  const screenTile = $('screenTile');
+  const screenVideo = $('screenVideo');
+  const cropCanvas = $('cropCanvas');
+  const cropHint = $('cropHint');
+  const screenShareBtn = $('screenShareBtn');
+  const screenShareBtnText = $('screenShareBtnText');
+  const recropBtn = $('recropBtn');
+  const screenStreamBtn = $('screenStreamBtn');
+  const screenStreamBtnText = $('screenStreamBtnText');
+  const screenChipRec = $('screenChipRec'), screenChipCount = $('screenChipCount');
+  const screenChipFace = $('screenChipFace'), screenChipElapsed = $('screenChipElapsed');
+  const screenProgressFill = $('screenProgressFill');
+  const screenVerdict = $('screenVerdict');
+
+  let screenStream = null;
+  let screenSessionId = null;
+  let screenCaptureTimer = null, screenElapsedTimer = null;
+  let screenStreaming = false, screenStartedAt = 0;
+  const screenCanvas = document.createElement('canvas'); // 실제 crop된 프레임을 그릴 오프스크린 캔버스
+
+  // crop 영역 (화면 공유 원본 해상도 기준 좌표, 0~1 정규화 비율로 저장)
+  let cropRect = null; // {x, y, w, h} — 비율(0~1)
+  let isDragging = false, dragStart = null;
+
+  screenShareBtn.addEventListener('click', () => {
+    if (screenStream) { stopScreenShare(); return; }
+    startScreenShare();
+  });
+
+  async function startScreenShare(){
+    try{
+      screenStream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 15 }, audio: false });
+      screenVideo.srcObject = screenStream;
+      await screenVideo.play();
+
+      screenTile.classList.remove('idle');
+      screenShareBtnText.textContent = '화면 공유 중지';
+      log('화면 공유 시작됨. 상대방 얼굴이 보이는 영역을 드래그로 선택하세요.', 'em');
+
+      // 화면 공유가 브라우저 상단 "공유 중지" 버튼 등으로 강제 종료될 때 대비
+      screenStream.getVideoTracks()[0].addEventListener('ended', stopScreenShare);
+
+      setupCropSelection();
+    }catch(err){
+      log('화면 공유를 시작할 수 없습니다: ' + err.message, 'err');
+    }
+  }
+
+  function setupCropSelection(){
+    cropRect = null;
+    cropCanvas.classList.add('active');
+    cropHint.classList.remove('hidden');
+    recropBtn.classList.add('hidden');
+    screenStreamBtn.classList.add('hidden');
+    drawCropOverlay();
+  }
+
+  function canvasSize(){
+    // crop 캔버스를 타일 실제 표시 크기에 맞춘다
+    const rect = screenTile.getBoundingClientRect();
+    cropCanvas.width = rect.width;
+    cropCanvas.height = rect.height;
+  }
+
+  function drawCropOverlay(rectPx=null){
+    canvasSize();
+    const ctx = cropCanvas.getContext('2d');
+    ctx.clearRect(0, 0, cropCanvas.width, cropCanvas.height);
+    ctx.fillStyle = 'rgba(11,13,16,0.45)';
+    ctx.fillRect(0, 0, cropCanvas.width, cropCanvas.height);
+    if (rectPx){
+      ctx.clearRect(rectPx.x, rectPx.y, rectPx.w, rectPx.h);
+      ctx.strokeStyle = '#22d3ee';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(rectPx.x, rectPx.y, rectPx.w, rectPx.h);
+    }
+  }
+
+  cropCanvas.addEventListener('mousedown', (e) => {
+    if (!cropCanvas.classList.contains('active')) return;
+    const r = cropCanvas.getBoundingClientRect();
+    dragStart = { x: e.clientX - r.left, y: e.clientY - r.top };
+    isDragging = true;
+  });
+  cropCanvas.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    const r = cropCanvas.getBoundingClientRect();
+    const cur = { x: e.clientX - r.left, y: e.clientY - r.top };
+    const rectPx = normalizeDragRect(dragStart, cur);
+    drawCropOverlay(rectPx);
+  });
+  window.addEventListener('mouseup', (e) => {
+    if (!isDragging) return;
+    isDragging = false;
+    const r = cropCanvas.getBoundingClientRect();
+    const cur = { x: e.clientX - r.left, y: e.clientY - r.top };
+    const rectPx = normalizeDragRect(dragStart, cur);
+    if (rectPx.w < 20 || rectPx.h < 20){
+      // 너무 작은 선택은 무시 (실수로 클릭만 한 경우)
+      return;
+    }
+    // 비율(0~1)로 저장 — 화면 리사이즈/실제 캡처 해상도와 무관하게 재사용
+    cropRect = {
+      x: rectPx.x / cropCanvas.width,
+      y: rectPx.y / cropCanvas.height,
+      w: rectPx.w / cropCanvas.width,
+      h: rectPx.h / cropCanvas.height,
+    };
+    cropCanvas.classList.remove('active');
+    cropHint.classList.add('hidden');
+    recropBtn.classList.remove('hidden');
+    screenStreamBtn.classList.remove('hidden');
+    log('분석 영역이 지정되었습니다. "분석 시작"을 눌러 판정을 시작하세요.', 'ok');
+  });
+
+  function normalizeDragRect(a, b){
+    return {
+      x: Math.min(a.x, b.x), y: Math.min(a.y, b.y),
+      w: Math.abs(b.x - a.x), h: Math.abs(b.y - a.y),
+    };
+  }
+
+  recropBtn.addEventListener('click', () => {
+    stopScreenStreaming(false);
+    setupCropSelection();
+  });
+
+  screenStreamBtn.addEventListener('click', () => {
+    if (screenStreaming) stopScreenStreaming(false);
+    else startScreenStreaming();
+  });
+
+  async function startScreenStreaming(){
+    if (!cropRect){ log('먼저 분석 영역을 선택하세요.', 'err'); return; }
+    screenVerdict.classList.remove('show'); screenVerdict.className = 'verdict';
+    resetSidePanel();
+    try{
+      const url = await getServerUrl();
+      const r = await fetch(url + '/stream/start', { method:'POST' }); const d = await r.json();
+      screenSessionId = d.session_id;
+
+      screenStreaming = true; screenStartedAt = Date.now();
+      screenTile.classList.add('tracking');
+      screenStreamBtn.classList.replace('primary','danger'); screenStreamBtnText.textContent = '분석 중지';
+      screenChipRec.classList.remove('hidden'); screenChipCount.classList.remove('hidden');
+      screenChipFace.classList.remove('hidden'); screenChipElapsed.classList.remove('hidden');
+      setLive(true, 'LIVE');
+      log('세션 시작. 선택한 영역에서 10초 분량의 시선 데이터를 수집합니다.', 'em');
+
+      screenCaptureTimer = setInterval(captureAndSendScreenCrop, CAPTURE_INTERVAL_MS);
+      screenElapsedTimer = setInterval(()=>{
+        const s = Math.floor((Date.now()-screenStartedAt)/1000);
+        screenChipElapsed.textContent = String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0');
+      }, 500);
+    }catch(err){
+      log('세션 시작 실패: ' + err.message, 'err');
+      stopScreenStreaming(false);
+    }
+  }
+
+  function captureAndSendScreenCrop(){
+    if (!screenStreaming || !screenVideo.videoWidth || !cropRect) return;
+    // cropRect(비율)를 화면 공유 원본 해상도 기준 실제 픽셀 좌표로 환산
+    const sx = cropRect.x * screenVideo.videoWidth;
+    const sy = cropRect.y * screenVideo.videoHeight;
+    const sw = cropRect.w * screenVideo.videoWidth;
+    const sh = cropRect.h * screenVideo.videoHeight;
+
+    screenCanvas.width = sw; screenCanvas.height = sh;
+    screenCanvas.getContext('2d').drawImage(screenVideo, sx, sy, sw, sh, 0, 0, sw, sh);
+
+    screenCanvas.toBlob(async (blob) => {
+      if (!blob || !screenStreaming) return;
+      const fd = new FormData(); fd.append('session_id', screenSessionId); fd.append('frame', blob, 'frame.jpg');
+      try{
+        const r = await fetch(ptgazeServerUrl + '/stream/frame', { method:'POST', body:fd });
+        const d = await r.json();
+        const found = d.face_detected;
+        screenChipFace.textContent = found ? '얼굴 추적 중' : '선택 영역에 얼굴 없음';
+        screenChipFace.className = 'chip ' + (found ? 'ok' : 'warn');
+        screenTile.classList.toggle('lost', !found);
+        const p = Math.min(100, Math.round(d.samples_collected / TARGET_SAMPLES * 100));
+        screenChipCount.textContent = `${d.samples_collected} / ${TARGET_SAMPLES}`;
+        screenProgressFill.style.width = p + '%';
+        if (d.samples_collected >= TARGET_SAMPLES) await runScreenPrediction();
+      }catch(e){ console.warn('프레임 전송 실패', e); }
+    }, 'image/jpeg', 0.8);
+  }
+
+  async function runScreenPrediction(){
+    clearInterval(screenCaptureTimer); screenCaptureTimer = null;
+    screenChipRec.classList.add('hidden');
+    setLive(true, '판정 중');
+    log('수집 완료. 시선+깜빡임 앙상블로 판정합니다…');
+
+    try{
+      const r = await fetch('/analyze/stream/predict', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ session_id: screenSessionId }),
+      });
+      const d = await r.json();
+      if (!r.ok || d.error) throw new Error(d.error || '분석에 실패했습니다.');
+      showScreenVerdict(d);
+      fillSidePanel(d);
+      log(`판정: ${d.is_fake ? 'FAKE' : 'REAL'} (신뢰도 ${d.confidence}%)`, d.is_fake ? 'err' : 'ok');
+      if (d.used_blink_ensemble === false) log('깜빡임 데이터 부족 → 시선 단독으로 판정됨', 'em');
+    }catch(err){
+      log('판정 오류: ' + err.message, 'err');
+    }finally{
+      // 한 시퀀스 종료 후 자동으로 다음으로 넘어가지 않는다 (요청사항과 동일한 정책)
+      stopScreenStreaming(true);
+    }
+  }
+
+  function showScreenVerdict(d){
+    const isFake = d.is_fake;
+    screenVerdict.className = 'verdict show ' + (isFake ? 'fake' : 'genuine');
+    $('screenVBadge').textContent = isFake ? 'DEEPFAKE DETECTED' : 'AUTHENTIC';
+    $('screenVLabel').textContent = isFake ? '딥페이크로 추정' : '실제 영상으로 추정';
+    $('screenVConf').textContent = d.confidence + '%';
+    $('screenVSub').textContent = isFake
+      ? '상대방의 시선 움직임이 인위적으로 매끈합니다'
+      : '상대방의 시선에 자연스러운 미세 떨림이 관측됩니다';
+  }
+
+  function stopScreenStreaming(keepVerdict){
+    screenStreaming = false;
+    if (screenCaptureTimer){ clearInterval(screenCaptureTimer); screenCaptureTimer=null; }
+    if (screenElapsedTimer){ clearInterval(screenElapsedTimer); screenElapsedTimer=null; }
+    if (screenSessionId && ptgazeServerUrl){
+      fetch(ptgazeServerUrl + '/stream/end', { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ session_id: screenSessionId }) }).catch(()=>{});
+      screenSessionId = null;
+    }
+    screenTile.classList.remove('tracking','lost');
+    screenStreamBtn.classList.replace('danger','primary'); screenStreamBtnText.textContent = '분석 시작';
+    [screenChipRec, screenChipCount, screenChipFace, screenChipElapsed].forEach(c => c.classList.add('hidden'));
+    screenProgressFill.style.width = '0%';
+    if (!keepVerdict){ screenVerdict.classList.remove('show'); }
+    setLive(false, keepVerdict ? '판정 완료' : '대기');
+    if (keepVerdict) log('세션 종료. 다시 분석하려면 "분석 시작"을 누르세요.');
+  }
+
+  function stopScreenShare(){
+    stopScreenStreaming(false);
+    if (screenStream){ screenStream.getTracks().forEach(t => t.stop()); screenStream = null; }
+    screenVideo.srcObject = null;
+    screenTile.classList.add('idle');
+    cropCanvas.classList.remove('active');
+    cropHint.classList.add('hidden');
+    recropBtn.classList.add('hidden');
+    screenStreamBtn.classList.add('hidden');
+    screenShareBtnText.textContent = '화면 공유 시작';
+    cropRect = null;
+  }
+  window.addEventListener('beforeunload', () => stopScreenShare());
+</script>
+</body>
+</html>

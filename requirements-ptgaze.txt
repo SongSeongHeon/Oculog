@@ -1,0 +1,16 @@
+# 시선/깜빡임 추출 서버(ptgaze_server.py) 환경 "oculog_ptgaze" — Python 3.9 권장
+#   conda create -n oculog_ptgaze python=3.9 -y && conda activate oculog_ptgaze
+#   pip install -r requirements-ptgaze.txt
+#   python src/patch_ptgaze.py        # ptgaze 구버전 API 호환 패치 (설치 후 1회)
+#
+# tensorflow 환경(oculog)과 분리한 이유: mediapipe(<=0.10.14)가 요구하는 protobuf<5 와
+# tensorflow가 요구하는 protobuf>=6.31 범위가 겹치지 않아 한 환경에 설치할 수 없다.
+# GPU가 없으면 torch/torchvision은 CPU 빌드를 설치해도 된다.
+ptgaze==0.2.8
+mediapipe==0.10.14
+opencv-python-headless
+numpy
+torch
+torchvision
+flask>=3.0.0
+requests>=2.31.0
